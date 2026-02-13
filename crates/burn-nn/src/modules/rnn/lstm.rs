@@ -72,16 +72,8 @@ pub struct LstmConfig {
 #[derive(Module, Debug)]
 #[module(custom_display)]
 pub struct Lstm<B: Backend> {
-    /// The input gate regulates which information to update and store in the cell state at each time step.
-    pub input_gate: GateController<B>,
-    /// The forget gate is used to control which information to discard or keep in the memory cell at each time step.
-    /// Note: When `input_forget` is true, this gate is not used (forget = 1 - input).
-    pub forget_gate: GateController<B>,
-    /// The output gate determines which information from the cell state to output at each time step.
-    pub output_gate: GateController<B>,
-    /// The cell gate is used to compute the cell state that stores and carries information through time.
-    pub cell_gate: GateController<B>,
-    /// The hidden state of the LSTM.
+    /// The fused gate controller combines the input, forget, output, and cell gates into a single module.
+    pub fused_gate: GateController<B>,
     pub d_hidden: usize,
     /// If true, input is `[batch_size, seq_length, input_size]`.
     /// If false, input is `[seq_length, batch_size, input_size]`.
@@ -107,9 +99,10 @@ impl<B: Backend> ModuleDisplay for Lstm<B> {
             .optional()
     }
 
+    // TODO: divide by 4
     fn custom_content(&self, content: Content) -> Option<Content> {
-        let [d_input, _] = self.input_gate.input_transform.weight.shape().dims();
-        let bias = self.input_gate.input_transform.bias.is_some();
+        let [d_input, _] = self.fused_gate.input_transform.weight.shape().dims();
+        let bias = self.fused_gate.input_transform.bias.is_some();
 
         content
             .add("d_input", &d_input)
@@ -126,7 +119,7 @@ impl LstmConfig {
 
         let new_gate = || {
             GateController::new(
-                self.d_input,
+                self.d_input * 4, // Fused gate combines 4 gates into one linear transformation
                 d_output,
                 self.bias,
                 self.initializer.clone(),
@@ -135,10 +128,7 @@ impl LstmConfig {
         };
 
         Lstm {
-            input_gate: new_gate(),
-            forget_gate: new_gate(),
-            output_gate: new_gate(),
-            cell_gate: new_gate(),
+            fused_gate: new_gate(),
             d_hidden: self.d_hidden,
             batch_first: self.batch_first,
             reverse: self.reverse,
@@ -235,34 +225,22 @@ impl<B: Backend> Lstm<B> {
         for (input_t, t) in input_timestep_iter {
             let input_t = input_t.squeeze_dim(1);
 
-            // i(nput)g(ate) tensors
-            let biased_ig_input_sum = self
-                .input_gate
+            //`Wx*X bi + Wh*H + bh` where Wx = [Wxi, Wxf, Wxo, Wxc] and Wh = [Whi, Whf, Who, Whc]
+            // bias is also fused into one vector [bi, bf, bo, bc] and of shape [4*hidden_size]
+            // Wx is of shape [input_size, 4*hidden_size], Wh is of shape [hidden_size, 4*hidden_size]
+            // fused_sum is of shape [batch_size, 4*hidden_size]
+            let fused_sum = self
+                .fused_gate
                 .gate_product(input_t.clone(), hidden_state.clone());
-            let input_values = self.gate_activation.forward(biased_ig_input_sum);
-
-            // f(orget)g(ate) tensors - either computed or coupled to input gate
+            let gate_chunks = fused_sum.chunk(4, 1);
+            let input_values = self.gate_activation.forward(gate_chunks[0].clone());
             let forget_values = if self.input_forget {
-                // Coupled mode: f_t = 1 - i_t
-                input_values.clone().neg().add_scalar(1.0)
+                Tensor::ones_like(&input_values) - input_values.clone()
             } else {
-                let biased_fg_input_sum = self
-                    .forget_gate
-                    .gate_product(input_t.clone(), hidden_state.clone());
-                self.gate_activation.forward(biased_fg_input_sum)
+                self.gate_activation.forward(gate_chunks[1].clone())
             };
-
-            // o(output)g(ate) tensors
-            let biased_og_input_sum = self
-                .output_gate
-                .gate_product(input_t.clone(), hidden_state.clone());
-            let output_values = self.gate_activation.forward(biased_og_input_sum);
-
-            // c(ell)g(ate) tensors
-            let biased_cg_input_sum = self
-                .cell_gate
-                .gate_product(input_t.clone(), hidden_state.clone());
-            let candidate_cell_values = self.cell_activation.forward(biased_cg_input_sum);
+            let output_values = self.gate_activation.forward(gate_chunks[2].clone());
+            let candidate_cell_values = self.cell_activation.forward(gate_chunks[3].clone());
 
             cell_state = forget_values * cell_state.clone() + input_values * candidate_cell_values;
 
@@ -350,12 +328,12 @@ impl<B: Backend> ModuleDisplay for BiLstm<B> {
     fn custom_content(&self, content: Content) -> Option<Content> {
         let [d_input, _] = self
             .forward
-            .input_gate
+            .fused_gate
             .input_transform
             .weight
             .shape()
             .dims();
-        let bias = self.forward.input_gate.input_transform.bias.is_some();
+        let bias = self.forward.fused_gate.input_transform.bias.is_some();
 
         content
             .add("d_input", &d_input)
@@ -502,6 +480,34 @@ mod tests {
     #[cfg(feature = "std")]
     use crate::TestAutodiffBackend;
 
+    fn create_gate_controller<const D1: usize, const D2: usize, const D3: usize>(
+        input_weights: [[f32; D1]; D2],
+        input_biases: [f32; D1],
+        hidden_weights: [[f32; D1]; D3],
+        hidden_biases: [f32; D1],
+        device: &Device<TestBackend>,
+    ) -> GateController<TestBackend> {
+        let d_input = input_weights[0].len();
+        let d_output = input_weights.len();
+
+        let input_record = LinearRecord {
+            weight: Param::from_data(TensorData::from(input_weights), device),
+            bias: Some(Param::from_data(TensorData::from(input_biases), device)),
+        };
+        let hidden_record = LinearRecord {
+            weight: Param::from_data(TensorData::from(hidden_weights), device),
+            bias: Some(Param::from_data(TensorData::from(hidden_biases), device)),
+        };
+        GateController::create_with_weights(
+            d_input,
+            d_output,
+            true,
+            Initializer::XavierUniform { gain: 1.0 },
+            input_record,
+            hidden_record,
+        )
+    }
+
     #[test]
     fn test_with_uniform_initializer() {
         let device = Default::default();
@@ -514,10 +520,7 @@ mod tests {
         let gate_to_data =
             |gate: GateController<TestBackend>| gate.input_transform.weight.val().to_data();
 
-        gate_to_data(lstm.input_gate).assert_within_range::<FT>(0.elem()..1.elem());
-        gate_to_data(lstm.forget_gate).assert_within_range::<FT>(0.elem()..1.elem());
-        gate_to_data(lstm.output_gate).assert_within_range::<FT>(0.elem()..1.elem());
-        gate_to_data(lstm.cell_gate).assert_within_range::<FT>(0.elem()..1.elem());
+        gate_to_data(lstm.fused_gate).assert_within_range::<FT>(0.elem()..1.elem());
     }
 
     /// Test forward pass with simple input vector.
@@ -537,67 +540,18 @@ mod tests {
         let device = Default::default();
         let mut lstm = config.init::<TestBackend>(&device);
 
-        fn create_gate_controller(
-            weights: f32,
-            biases: f32,
-            d_input: usize,
-            d_output: usize,
-            bias: bool,
-            initializer: Initializer,
-            device: &Device<TestBackend>,
-        ) -> GateController<TestBackend> {
-            let record_1 = LinearRecord {
-                weight: Param::from_data(TensorData::from([[weights]]), device),
-                bias: Some(Param::from_data(TensorData::from([biases]), device)),
-            };
-            let record_2 = LinearRecord {
-                weight: Param::from_data(TensorData::from([[weights]]), device),
-                bias: Some(Param::from_data(TensorData::from([biases]), device)),
-            };
-            GateController::create_with_weights(
-                d_input,
-                d_output,
-                bias,
-                initializer,
-                record_1,
-                record_2,
-            )
-        }
-
-        lstm.input_gate = create_gate_controller(
-            0.5,
-            0.0,
-            1,
-            1,
-            false,
-            Initializer::XavierUniform { gain: 1.0 },
-            &device,
-        );
-        lstm.forget_gate = create_gate_controller(
-            0.7,
-            0.0,
-            1,
-            1,
-            false,
-            Initializer::XavierUniform { gain: 1.0 },
-            &device,
-        );
-        lstm.cell_gate = create_gate_controller(
-            0.9,
-            0.0,
-            1,
-            1,
-            false,
-            Initializer::XavierUniform { gain: 1.0 },
-            &device,
-        );
-        lstm.output_gate = create_gate_controller(
-            1.1,
-            0.0,
-            1,
-            1,
-            false,
-            Initializer::XavierUniform { gain: 1.0 },
+        // Create fused gate with weights for all 4 gates concatenated
+        // Order: [input_gate, forget_gate, output_gate, cell_gate]
+        lstm.fused_gate = create_gate_controller(
+            [[0.5f32, 0.7, 1.1, 0.9]],
+            [0.0, 0.0, 0.0, 0.0],
+            [
+                [0.0f32, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+                [0.0, 0.0, 0.0, 0.0],
+            ],
+            [0.0, 0.0, 0.0, 0.0],
             &device,
         );
 
@@ -669,7 +623,7 @@ mod tests {
         let grads = fake_loss.backward();
 
         let some_gradient = lstm
-            .output_gate
+            .fused_gate
             .hidden_transform
             .weight
             .grad(&grads)
@@ -696,34 +650,6 @@ mod tests {
         let device = Default::default();
         let mut lstm = config.init(&device);
 
-        fn create_gate_controller<const D1: usize, const D2: usize>(
-            input_weights: [[f32; D1]; D2],
-            input_biases: [f32; D1],
-            hidden_weights: [[f32; D1]; D1],
-            hidden_biases: [f32; D1],
-            device: &Device<TestBackend>,
-        ) -> GateController<TestBackend> {
-            let d_input = input_weights[0].len();
-            let d_output = input_weights.len();
-
-            let input_record = LinearRecord {
-                weight: Param::from_data(TensorData::from(input_weights), device),
-                bias: Some(Param::from_data(TensorData::from(input_biases), device)),
-            };
-            let hidden_record = LinearRecord {
-                weight: Param::from_data(TensorData::from(hidden_weights), device),
-                bias: Some(Param::from_data(TensorData::from(hidden_biases), device)),
-            };
-            GateController::create_with_weights(
-                d_input,
-                d_output,
-                true,
-                Initializer::XavierUniform { gain: 1.0 },
-                input_record,
-                hidden_record,
-            )
-        }
-
         let input = Tensor::<TestBackend, 3>::from_data(
             TensorData::from([[
                 [0.949, -0.861],
@@ -742,99 +668,75 @@ mod tests {
             &device,
         );
 
-        lstm.forward.input_gate = create_gate_controller(
-            [[0.367, 0.091, 0.342], [0.322, 0.533, 0.059]],
-            [-0.196, 0.354, 0.209],
+        lstm.forward.fused_gate = create_gate_controller(
             [
-                [-0.320, 0.232, -0.165],
-                [0.093, -0.572, -0.315],
-                [-0.467, 0.325, 0.046],
+                [
+                    0.367f32, 0.091, 0.342, -0.342, -0.084, -0.420, -0.577, -0.359, 0.216, -0.046,
+                    -0.382, 0.321,
+                ],
+                [
+                    0.322, 0.533, 0.059, -0.432, 0.119, 0.191, -0.550, 0.268, 0.243, -0.533, 0.558,
+                    0.004,
+                ],
             ],
-            [0.181, -0.190, -0.245],
+            [
+                -0.196f32, 0.354, 0.209, 0.315, -0.413, -0.041, -0.227, -0.274, 0.039, -0.358,
+                0.282, -0.078,
+            ],
+            [
+                [
+                    -0.320f32, 0.232, -0.165, 0.453, 0.063, 0.561, -0.383, 0.449, 0.222, -0.358,
+                    0.109, 0.139,
+                ],
+                [
+                    0.093, -0.572, -0.315, 0.211, 0.149, 0.213, -0.357, -0.093, 0.449, -0.345,
+                    0.091, -0.368,
+                ],
+                [
+                    -0.467, 0.325, 0.046, -0.499, -0.158, 0.068, -0.106, 0.236, 0.360, -0.508,
+                    0.221, -0.507,
+                ],
+            ],
+            [
+                0.181f32, -0.190, -0.245, -0.431, -0.535, 0.125, -0.361, -0.209, -0.454, 0.502,
+                -0.509, -0.247,
+            ],
             &device,
         );
 
-        lstm.forward.forget_gate = create_gate_controller(
-            [[-0.342, -0.084, -0.420], [-0.432, 0.119, 0.191]],
-            [0.315, -0.413, -0.041],
+        lstm.reverse.fused_gate = create_gate_controller(
             [
-                [0.453, 0.063, 0.561],
-                [0.211, 0.149, 0.213],
-                [-0.499, -0.158, 0.068],
+                [
+                    -0.055f32, 0.506, 0.247, -0.154, -0.432, -0.547, 0.491, -0.442, 0.333, -0.571,
+                    0.228, -0.287,
+                ],
+                [
+                    -0.369, 0.178, -0.258, -0.369, -0.310, -0.175, 0.313, -0.121, -0.070, -0.331,
+                    0.110, 0.219,
+                ],
             ],
-            [-0.431, -0.535, 0.125],
-            &device,
-        );
-
-        lstm.forward.cell_gate = create_gate_controller(
-            [[-0.046, -0.382, 0.321], [-0.533, 0.558, 0.004]],
-            [-0.358, 0.282, -0.078],
             [
-                [-0.358, 0.109, 0.139],
-                [-0.345, 0.091, -0.368],
-                [-0.508, 0.221, -0.507],
+                0.540f32, -0.164, 0.033, 0.141, 0.004, 0.055, -0.387, -0.250, 0.066, -0.206,
+                -0.546, 0.462,
             ],
-            [0.502, -0.509, -0.247],
-            &device,
-        );
-
-        lstm.forward.output_gate = create_gate_controller(
-            [[-0.577, -0.359, 0.216], [-0.550, 0.268, 0.243]],
-            [-0.227, -0.274, 0.039],
             [
-                [-0.383, 0.449, 0.222],
-                [-0.357, -0.093, 0.449],
-                [-0.106, 0.236, 0.360],
+                [
+                    0.159f32, 0.180, -0.037, -0.005, -0.277, -0.515, -0.030, 0.268, 0.299, 0.449,
+                    -0.240, 0.071,
+                ],
+                [
+                    -0.443, 0.485, -0.488, -0.011, -0.101, -0.365, -0.019, -0.280, -0.314, -0.045,
+                    0.131, 0.124,
+                ],
+                [
+                    0.098, -0.085, -0.140, 0.426, 0.379, 0.337, 0.466, -0.365, -0.248, 0.138,
+                    -0.201, 0.191,
+                ],
             ],
-            [-0.361, -0.209, -0.454],
-            &device,
-        );
-
-        lstm.reverse.input_gate = create_gate_controller(
-            [[-0.055, 0.506, 0.247], [-0.369, 0.178, -0.258]],
-            [0.540, -0.164, 0.033],
             [
-                [0.159, 0.180, -0.037],
-                [-0.443, 0.485, -0.488],
-                [0.098, -0.085, -0.140],
+                -0.510f32, 0.105, 0.114, -0.382, 0.331, -0.176, -0.398, -0.199, -0.566, -0.030,
+                0.211, -0.352,
             ],
-            [-0.510, 0.105, 0.114],
-            &device,
-        );
-
-        lstm.reverse.forget_gate = create_gate_controller(
-            [[-0.154, -0.432, -0.547], [-0.369, -0.310, -0.175]],
-            [0.141, 0.004, 0.055],
-            [
-                [-0.005, -0.277, -0.515],
-                [-0.011, -0.101, -0.365],
-                [0.426, 0.379, 0.337],
-            ],
-            [-0.382, 0.331, -0.176],
-            &device,
-        );
-
-        lstm.reverse.cell_gate = create_gate_controller(
-            [[-0.571, 0.228, -0.287], [-0.331, 0.110, 0.219]],
-            [-0.206, -0.546, 0.462],
-            [
-                [0.449, -0.240, 0.071],
-                [-0.045, 0.131, 0.124],
-                [0.138, -0.201, 0.191],
-            ],
-            [-0.030, 0.211, -0.352],
-            &device,
-        );
-
-        lstm.reverse.output_gate = create_gate_controller(
-            [[0.491, -0.442, 0.333], [0.313, -0.121, -0.070]],
-            [-0.387, -0.250, 0.066],
-            [
-                [-0.030, 0.268, 0.299],
-                [-0.019, -0.280, -0.314],
-                [0.466, -0.365, -0.248],
-            ],
-            [-0.398, -0.199, -0.566],
             &device,
         );
 
